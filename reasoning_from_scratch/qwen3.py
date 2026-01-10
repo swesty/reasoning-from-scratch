@@ -230,20 +230,19 @@ class GroupedQueryAttention(nn.Module):
 #
 # 1) Split-halves style (this repo, Hugging Face Transformers):
 #
-#   For hidden dim d = 8 (example):
+#   For hidden dim d = 4 (example):
 #
-#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
-#         │    │    │    │    │    │    │    │
-#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
-#        cos  cos  cos  cos  sin  sin  sin  sin
+#       [ x0   x1 | x2   x3 ]
+#         │    │    │    │
+#         ▼    ▼    ▼    ▼
+#        cos  cos  sin  sin
 #
 #   Rotation matrix:
 #
-#       [ cosθ   -sinθ    0      0   ... ]
-#       [ sinθ    cosθ    0      0   ... ]
-#       [  0       0    cosθ   -sinθ ... ]
-#       [  0       0    sinθ    cosθ ... ]
-#        ...
+#       [ cosθ0   0    -sinθ0   0   ]
+#       [  0    cosθ1    0    -sinθ1]
+#       [ sinθ0   0     cosθ0   0   ]
+#       [  0    sinθ1    0     cosθ1]
 #
 #   Here, the embedding dims are split into two halves and then
 #   each one is rotated in blocks.
@@ -251,19 +250,20 @@ class GroupedQueryAttention(nn.Module):
 #
 # 2) Interleaved (even/odd) style (original paper, Llama repo):
 #
-#   For hidden dim d = 8 (example):
+#   For hidden dim d = 4 (example):
 #
-#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
-#         │    │    │    │    │    │    │    │
-#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
-#        cos  sin  cos  sin  cos  sin  cos  sin
+#       [ x0   x1   x2   x3 ]
+#         │    │    │    │
+#         ▼    ▼    ▼    ▼
+#        cos  sin  cos  sin
 #
 #   Rotation matrix:
-#       [ cosθ  -sinθ    0      0   ... ]
-#       [ sinθ   cosθ    0      0   ... ]
-#       [  0      0    cosθ   -sinθ ... ]
-#       [  0      0    sinθ    cosθ ... ]
-#        ...
+#
+#       [ cosθ0  -sinθ0   0       0    ]
+#       [ sinθ0   cosθ0   0       0    ]
+#       [  0        0    cosθ1  -sinθ1 ]
+#       [  0        0    sinθ1   cosθ1 ]
+#
 #
 #   Here, embedding dims are interleaved as even/odd cosine/sine pairs.
 #
@@ -581,44 +581,3 @@ def load_hf_weights_into_qwen(model, param_config, params):
     else:
         model.out_head.weight = model.tok_emb.weight
         print("Model uses weight tying.")
-
-
-def get_model(which_model, device, use_compile):
-    if which_model == "base":
-
-        download_qwen3_small(
-            kind="base", tokenizer_only=False, out_dir="qwen3"
-        )
-
-        tokenizer_path = Path("qwen3") / "tokenizer-base.json"
-        model_path = Path("qwen3") / "qwen3-0.6B-base.pth"
-        tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
-
-    elif which_model in ("reasoning", "instruct"):
-
-        download_qwen3_small(
-            kind="reasoning", tokenizer_only=False, out_dir="qwen3"
-        )
-
-        tokenizer_path = Path("qwen3") / "tokenizer-reasoning.json"
-        model_path = Path("qwen3") / "qwen3-0.6B-reasoning.pth"
-        tokenizer = Qwen3Tokenizer(
-            tokenizer_file_path=tokenizer_path,
-            apply_chat_template=True,
-            add_generation_prompt=True,
-            add_thinking=which_model == "reasoning",
-        )
-
-    else:
-        raise ValueError(f"Invalid choice: WHICH_MODEL={which_model}")
-
-    model = Qwen3Model(QWEN_CONFIG_06_B)
-    model.load_state_dict(torch.load(model_path))
-
-    model.to(device)
-
-    if use_compile:
-        torch._dynamo.config.allow_unspec_int_on_nn_module = True
-        model = torch.compile(model)
-
-    return model, tokenizer

@@ -6,12 +6,20 @@ from pathlib import Path
 import json
 import re
 import time
+
+import requests
 from sympy import simplify
 from sympy.parsing import sympy_parser as spp
 from sympy.core.sympify import SympifyError
 from tokenize import TokenError
 import torch
 
+from .qwen3 import (
+    download_qwen3_small,
+    Qwen3Tokenizer,
+    Qwen3Model,
+    QWEN_CONFIG_06_B
+)
 from .ch02_ex import (
     generate_text_basic_stream_cache
 )
@@ -33,6 +41,80 @@ LATEX_FIXES = [  # Latex formatting to be replaced
 ]
 
 RE_SPECIAL = re.compile(r"<\|[^>]+?\|>")  # strip chat special tokens like <|assistant|>
+SUPERSCRIPT_MAP = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "⁺": "+", "⁻": "-", "⁽": "(", "⁾": ")",
+}
+
+
+def load_model_and_tokenizer(which_model, device, use_compile, local_dir="qwen3"):
+    if which_model == "base":
+
+        download_qwen3_small(
+            kind="base", tokenizer_only=False, out_dir=local_dir
+        )
+
+        tokenizer_path = Path(local_dir) / "tokenizer-base.json"
+        model_path = Path(local_dir) / "qwen3-0.6B-base.pth"
+        tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
+
+    elif which_model == "reasoning":
+
+        download_qwen3_small(
+            kind="reasoning", tokenizer_only=False, out_dir=local_dir
+        )
+
+        tokenizer_path = Path(local_dir) / "tokenizer-reasoning.json"
+        model_path = Path(local_dir) / "qwen3-0.6B-reasoning.pth"
+        tokenizer = Qwen3Tokenizer(
+            tokenizer_file_path=tokenizer_path,
+            apply_chat_template=True,
+            add_generation_prompt=True,
+            add_thinking=True,
+        )
+
+    else:
+        raise ValueError(f"Invalid choice: which_model={which_model}")
+
+    model = Qwen3Model(QWEN_CONFIG_06_B)
+    model.load_state_dict(torch.load(model_path))
+
+    model.to(device)
+
+    if use_compile:
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        model = torch.compile(model)
+
+    return model, tokenizer
+
+
+def load_tokenizer_only(which_model, local_dir="qwen3"):
+    if which_model == "base":
+        download_qwen3_small(
+            kind="base", tokenizer_only=True, out_dir=local_dir
+        )
+
+        tokenizer_path = Path(local_dir) / "tokenizer-base.json"
+        tokenizer = Qwen3Tokenizer(tokenizer_file_path=tokenizer_path)
+
+    elif which_model == "reasoning":
+        download_qwen3_small(
+            kind="reasoning", tokenizer_only=True, out_dir=local_dir
+        )
+
+        tokenizer_path = Path(local_dir) / "tokenizer-reasoning.json"
+        tokenizer = Qwen3Tokenizer(
+            tokenizer_file_path=tokenizer_path,
+            apply_chat_template=True,
+            add_generation_prompt=True,
+            add_thinking=True,
+        )
+
+    else:
+        raise ValueError(f"Invalid choice: which_model={which_model}")
+
+    return tokenizer
 
 
 def generate_text_stream_concat(
@@ -127,6 +209,12 @@ def normalize_text(text):
         return ""
     text = RE_SPECIAL.sub("", text).strip()
 
+    # Strip leading multiple-choice labels
+    # E.g., like "c. 3" -> 3, or "b: 2" -> 2
+    match = re.match(r"^[A-Za-z]\s*[.:]\s*(.+)$", text)
+    if match:
+        text = match.group(1)
+
     # Remove angle-degree markers
     text = re.sub(r"\^\s*\{\s*\\circ\s*\}", "", text)   # ^{\circ}
     text = re.sub(r"\^\s*\\circ", "", text)             # ^\circ
@@ -143,6 +231,23 @@ def normalize_text(text):
     # light LaTeX canonicalization
     for pat, rep in LATEX_FIXES:
         text = re.sub(pat, rep, text)
+
+    # convert unicode superscripts into exponent form (e.g., 2² -> 2**2)
+    def convert_superscripts(s, base=None):
+        converted = "".join(
+            SUPERSCRIPT_MAP[ch] if ch in SUPERSCRIPT_MAP else ch
+            for ch in s
+        )
+        if base is None:
+            return converted
+        return f"{base}**{converted}"
+
+    text = re.sub(
+        r"([0-9A-Za-z\)\]\}])([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+)",
+        lambda m: convert_superscripts(m.group(2), base=m.group(1)),
+        text,
+    )
+    text = convert_superscripts(text)
 
     # numbers/roots
     text = text.replace("\\%", "%").replace("$", "").replace("%", "")
@@ -188,6 +293,10 @@ def normalize_text(text):
 
 
 def sympy_parser(expr):
+    # To avoid crashing on long garbage responses
+    # that some badly trained models (chapter 6) may emit
+    if expr is None or len(expr) > 2000:
+        return None
     try:
         return spp.parse_expr(
             expr,
@@ -202,7 +311,8 @@ def sympy_parser(expr):
             # Evaluate during parsing so simple constants simplify (e.g., 2+3 -> 5)
             evaluate=True,
         )
-    except (SympifyError, SyntaxError, TypeError, IndexError, TokenError):
+    except (SympifyError, SyntaxError, TypeError,
+            IndexError, TokenError, ValueError):
         return None
 
 
@@ -309,6 +419,28 @@ def render_prompt(prompt):
     return template
 
 
+def load_math500_test(local_path="math500_test.json", save_copy=True):
+    local_path = Path(local_path)
+    url = (
+        "https://raw.githubusercontent.com/rasbt/reasoning-from-scratch/"
+        "main/ch03/01_main-chapter-code/math500_test.json"
+    )
+
+    if local_path.exists():
+        with local_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        if save_copy:  # Saves a local copy
+            with local_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+    return data
+
+
 def mini_eval_demo(model, tokenizer, device):
     ex = {  # Test example with "problem" and "answer" fields
         "problem": "Compute 1/2 + 1/6.",
@@ -329,6 +461,42 @@ def mini_eval_demo(model, tokenizer, device):
     print(f"Correct: {is_correct}")
 
 
+def eta_progress_message(
+    processed,
+    total,
+    start_time,
+    show_eta=False,
+    label="Progress",
+):
+    progress = f"{label}: {processed}/{total}"
+    if not show_eta or processed <= 0:
+        return progress
+
+    elapsed = time.time() - start_time
+    if elapsed <= 0:
+        return progress
+
+    remaining = max(total - processed, 0)
+
+    if processed:
+        avg_time = elapsed / processed
+        eta_seconds = avg_time * remaining
+    else:
+        eta_seconds = 0
+
+    eta_seconds = max(int(round(eta_seconds)), 0)
+    minutes, rem_seconds = divmod(eta_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        eta = f"{hours}h {minutes:02d}m {rem_seconds:02d}s"
+    elif minutes:
+        eta = f"{minutes:02d}m {rem_seconds:02d}s"
+    else:
+        eta = f"{rem_seconds:02d}s"
+
+    return f"{progress} | ETA: {eta}"
+
+
 def evaluate_math500_stream(
     model,
     tokenizer,
@@ -345,8 +513,7 @@ def evaluate_math500_stream(
 
     num_examples = len(math_data)
     num_correct = 0
-    print(f"MATH-500: 0/{num_examples}", end="\r", flush=True)
-
+    total_len = 0  # Calculates the average response length (see exercise 3.2)
     start_time = time.time()
 
     with open(out_path, "w", encoding="utf-8") as f:  # Save results for inspection
@@ -357,6 +524,7 @@ def evaluate_math500_stream(
                 max_new_tokens=max_new_tokens,
                 verbose=verbose,
             )
+            total_len += len(tokenizer.encode(gen_text))
 
             extracted = extract_final_candidate(  # 3. Extract and normalize answer
                 gen_text
@@ -376,17 +544,20 @@ def evaluate_math500_stream(
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+            progress_msg = eta_progress_message(
+                processed=i,
+                total=num_examples,
+                start_time=start_time,
+                show_eta=True,
+                label="MATH-500",
+            )
+            print(progress_msg, end="\r", flush=True)
             if verbose:  # Print responses during the generation process
                 print(
-                    f"\n\n{'='*50}\nMATH-500: {i}/{num_examples}\n"
+                    f"\n\n{'='*50}\n{progress_msg}\n"
                     f"{'='*50}\nExtracted: {extracted}\n"
                     f"Expected:  {row['answer']}\n"
                     f"Correct so far: {num_correct}\n{'-'*50}"
-                )
-            else:
-                print(
-                    f"MATH-500: {i}/{num_examples}",
-                    end="\r", flush=True
                 )
 
     # Print summary information
@@ -394,5 +565,7 @@ def evaluate_math500_stream(
     acc = num_correct / num_examples if num_examples else 0.0
     print(f"\nAccuracy: {acc*100:.1f}% ({num_correct}/{num_examples})")
     print(f"Total time: {seconds_elapsed/60:.1f} min")
+    avg_len = total_len / num_examples
+    print(f"Average response length: {avg_len:.2f} tokens")
     print(f"Logs written to: {out_path}")
     return num_correct, num_examples, acc

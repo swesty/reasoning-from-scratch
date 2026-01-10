@@ -9,35 +9,25 @@ import argparse
 import json
 import time
 from pathlib import Path
-import requests
 
 import torch
 
+from reasoning_from_scratch.qwen3_batched import (
+    Qwen3Model,
+    QWEN_CONFIG_06_B
+)
 from reasoning_from_scratch.ch02 import get_device
-from reasoning_from_scratch.qwen3_batched import get_model
 from reasoning_from_scratch.ch03 import (
+    load_math500_test,
     render_prompt,
     extract_final_candidate,
     grade_answer,
+    eta_progress_message,
+    load_tokenizer_only
 )
-
-
-def get_data():
-    local_path = Path("math500_test.json")
-    url = (
-        "https://raw.githubusercontent.com/rasbt/reasoning-from-scratch/"
-        "main/ch03/01_main-chapter-code/math500_test.json"
-    )
-
-    if local_path.exists():
-        with local_path.open("r", encoding="utf-8") as f:
-            math_data = json.load(f)
-    else:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        math_data = r.json()
-
-    return math_data
+from reasoning_from_scratch.qwen3_batched import (
+    load_model_and_tokenizer,
+)
 
 
 def evaluate_math500_batched(
@@ -49,6 +39,7 @@ def evaluate_math500_batched(
     max_new_tokens=512,
     verbose=False,
     batch_size=4,
+    show_eta=False,
 ):
     model.eval()
 
@@ -59,7 +50,6 @@ def evaluate_math500_batched(
 
     num_examples = len(math_data)
     num_correct = 0
-    print(f"MATH-500: 0/{num_examples}", end="\r", flush=True)
 
     start_time = time.time()
 
@@ -120,17 +110,20 @@ def evaluate_math500_batched(
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+                progress_msg = eta_progress_message(
+                    processed=i,
+                    total=num_examples,
+                    start_time=start_time,
+                    show_eta=show_eta,
+                    label="MATH-500",
+                )
+                print(progress_msg, end="\r", flush=True)
                 if verbose:  # Print responses during the generation process
                     print(
-                        f"\n\n{'='*50}\nMATH-500: {i}/{num_examples}\n"
+                        f"\n\n{'='*50}\n{progress_msg}\n"
                         f"{'='*50}\nExtracted: {extracted}\n"
                         f"Expected:  {row['answer']}\n"
                         f"Correct so far: {num_correct}\n{'-'*50}"
-                    )
-                else:
-                    print(
-                        f"MATH-500: {i}/{num_examples}",
-                        end="\r", flush=True
                     )
 
     # Print summary information
@@ -173,6 +166,12 @@ def parse_args():
         "--compile",
         action="store_true",
         help="Enable torch.compile for the model.",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional path to a .pth checkpoint to load model weights from.",
     )
     parser.add_argument(
         "--batch_size",
@@ -219,8 +218,30 @@ if __name__ == "__main__":
     dev_name = str(device).replace(":", "-")
     print("Batch size:", batch_size)
 
-    math_data = get_data()[:dataset_size]
-    model, tokenizer = get_model(which_model, device, args.compile)
+    math_data = load_math500_test()[:dataset_size]
+    if args.which_model == "instruct":
+        which_model = "reasoning"
+    else:
+        which_model = args.which_model
+
+    if args.checkpoint_path:
+        # To load the saved RL checkpoint files from chapter 6
+        tokenizer = load_tokenizer_only(which_model=which_model)
+        model = Qwen3Model(QWEN_CONFIG_06_B)
+        model.to(device)
+        state_dict = torch.load(args.checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+        if args.compile:
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            model = torch.compile(model)
+    else:
+        model, tokenizer = load_model_and_tokenizer(
+            which_model=which_model,
+            device=device,
+            use_compile=args.compile
+        )
+    if args.which_model == "instruct":
+        tokenizer.add_thinking = False
 
     out_path = f"math500_{which_model}-{dev_name}-batched-bs{batch_size}.jsonl"
     num_correct, num_examples, acc = evaluate_math500_batched(
@@ -232,4 +253,5 @@ if __name__ == "__main__":
         max_new_tokens=max_new_tokens,
         out_path=out_path,
         verbose=args.verbose,
+        show_eta=True,
     )

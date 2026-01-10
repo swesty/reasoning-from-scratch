@@ -2,6 +2,7 @@
 # Source for "Build a Reasoning Model (From Scratch)": https://mng.bz/lZ5B
 # Code repository: https://github.com/rasbt/reasoning-from-scratch
 
+from pathlib import Path
 import json
 import sympy as sp
 import torch
@@ -19,6 +20,15 @@ class DummyTokenizer:
         if isinstance(ids, int):
             ids = [ids]
         return "".join(self._map.get(i, "?") for i in ids)
+
+
+def test_load_math500_test_has_500_entries():
+    repo_root = Path(__file__).resolve().parent.parent
+    local_path = repo_root / "math500_test.json"
+
+    data = ch03.load_math500_test(local_path=local_path, save_copy=False)
+
+    assert len(data) == 500
 
 
 def test_generate_text_stream_concat(monkeypatch):
@@ -97,6 +107,10 @@ def test_normalize():
         (r"\dfrac{14}{3}", "(14)/(3)"),
         (r"(3)/(4)", "(3)/(4)"),
 
+        # Multiple choice labels
+        ("c. 3", "3"),
+        ("b: 2", "2"),
+
         # Roots (don’t simplify math here but just normalize text)
         (r"\sqrt{2}", "sqrt(2)"),
 
@@ -131,10 +145,13 @@ def test_sympy_parser():
         # Numeric/symbolic equivalence
         assert sp.simplify(got - expected) == 0, f"{expr!r}: {got!r} != {expected!r}"
 
+    long_expr = "1" * 2001
     failure_cases = [
         "sqrt(",  # unbalanced
         "??",  # invalid tokens
         "2**",  # incomplete operator
+        None,  # guard against missing inputs
+        long_expr,  # guard against overly long inputs
     ]
     for expr in failure_cases:
         assert ch03.sympy_parser(expr) is None, f"expected None for {expr!r}"
@@ -262,7 +279,7 @@ def test_render_prompt():
         assert got.endswith("Answer:")
 
 
-def test_evaluate_math500_stream(tmp_path, monkeypatch):
+def test_evaluate_math500_stream(tmp_path, monkeypatch, qwen3_weights_path):
 
     outputs = iter([
         "Reasoning...\n\\boxed{A}",
@@ -279,10 +296,15 @@ def test_evaluate_math500_stream(tmp_path, monkeypatch):
         {"problem": "Compute #2", "answer": "B"},
     ]
 
+    tokenizer = ch03.load_tokenizer_only(
+        which_model="base",
+        local_dir=qwen3_weights_path,
+    )
+
     out_path = tmp_path / "math500-test.jsonl"
     num_correct, num_examples, acc = ch03.evaluate_math500_stream(
         model=None,
-        tokenizer=None,
+        tokenizer=tokenizer,
         device="cpu",
         math_data=math_data,
         out_path=out_path,

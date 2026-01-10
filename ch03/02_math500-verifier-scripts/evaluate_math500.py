@@ -3,33 +3,19 @@
 # Code repository: https://github.com/rasbt/reasoning-from-scratch
 
 import argparse
-import json
-from pathlib import Path
-import requests
-
 import torch
 
+from reasoning_from_scratch.qwen3 import (
+    Qwen3Model,
+    QWEN_CONFIG_06_B
+)
 from reasoning_from_scratch.ch02 import get_device
-from reasoning_from_scratch.ch03 import evaluate_math500_stream
-from reasoning_from_scratch.qwen3 import get_model
-
-
-def get_data():
-    local_path = Path("math500_test.json")
-    url = (
-        "https://raw.githubusercontent.com/rasbt/reasoning-from-scratch/"
-        "main/ch03/01_main-chapter-code/math500_test.json"
-    )
-
-    if local_path.exists():
-        with local_path.open("r", encoding="utf-8") as f:
-            math_data = json.load(f)
-    else:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        math_data = r.json()
-
-    return math_data
+from reasoning_from_scratch.ch03 import (
+    load_math500_test,
+    evaluate_math500_stream,
+    load_model_and_tokenizer,
+    load_tokenizer_only
+)
 
 
 def parse_args():
@@ -65,6 +51,12 @@ def parse_args():
         help="Enable torch.compile for the model.",
     )
     parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional path to a .pth checkpoint to load model weights from.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print per-sample correctness while evaluating.",
@@ -89,8 +81,33 @@ if __name__ == "__main__":
     print("Device:", device)
     dev_name = str(device).replace(":", "-")
 
-    math_data = get_data()
-    model, tokenizer = get_model(which_model, device, use_compile)
+    math_data = load_math500_test()
+
+    if args.which_model == "instruct":
+        which_model = "reasoning"
+    else:
+        which_model = args.which_model
+
+    if args.checkpoint_path:
+        # To load the saved RL checkpoint files from chapter 6
+        tokenizer = load_tokenizer_only(which_model=which_model)
+        model = Qwen3Model(QWEN_CONFIG_06_B)
+        state_dict = torch.load(args.checkpoint_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+        model.to(device)
+        if args.compile:
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            model = torch.compile(model)
+    else:
+        model, tokenizer = load_model_and_tokenizer(
+            which_model=which_model,
+            device=device,
+            use_compile=args.compile
+        )
+
+    if args.which_model == "instruct":
+        tokenizer.add_thinking = False
+
     model.eval()
     torch.set_float32_matmul_precision("high")
 
@@ -101,6 +118,5 @@ if __name__ == "__main__":
         device=device,
         math_data=math_data[:dataset_size],
         max_new_tokens=max_new_tokens,
-
-        verbose=args.verbose
+        verbose=args.verbose,
     )
