@@ -4,7 +4,7 @@ FROM nvcr.io/nvidia/pytorch:25.09-py3
 # --- OS deps ---
 USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    git git-lfs build-essential pkg-config python3-dev curl ca-certificates \
+    git git-lfs build-essential pkg-config python3-dev curl ca-certificates nvidia-cuda-toolkit\
  && rm -rf /var/lib/apt/lists/* \
  && git lfs install
 
